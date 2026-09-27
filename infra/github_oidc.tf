@@ -16,6 +16,22 @@ data "aws_iam_openid_connect_provider" "github_existing" {
 
 locals {
   github_oidc_provider_arn = var.create_github_oidc_provider ? aws_iam_openid_connect_provider.github[0].arn : data.aws_iam_openid_connect_provider.github_existing[0].arn
+
+  # Repositories created after 2026-07-15 send an "immutable" subject that includes numeric IDs:
+  #   repo:OWNER@OWNER_ID/REPO@REPO_ID:...   (older repos send repo:OWNER/REPO:...)
+  # The IDs stop a deleted-and-recreated repo with the same name from inheriting this role.
+  github_repo_owner = split("/", var.github_repository)[0]
+  github_repo_name  = split("/", var.github_repository)[1]
+  github_subject_repos = compact([
+    "repo:${var.github_repository}",
+    var.github_owner_id != "" && var.github_repository_id != "" ? "repo:${local.github_repo_owner}@${var.github_owner_id}/${local.github_repo_name}@${var.github_repository_id}" : "",
+  ])
+  github_allowed_subjects = flatten([
+    for repo in local.github_subject_repos : [
+      "${repo}:ref:refs/heads/${var.github_deploy_branch}",
+      "${repo}:environment:${var.github_environment}",
+    ]
+  ])
 }
 
 data "aws_iam_policy_document" "github_assume" {
@@ -36,10 +52,7 @@ data "aws_iam_policy_document" "github_assume" {
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values = [
-        "repo:${var.github_repository}:ref:refs/heads/${var.github_deploy_branch}",
-        "repo:${var.github_repository}:environment:${var.github_environment}",
-      ]
+      values   = local.github_allowed_subjects
     }
   }
 }

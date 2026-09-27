@@ -27,6 +27,26 @@ variable "github_repository" {
   default     = "eguidey/aws-appsec-pipeline"
 }
 
+variable "github_owner_id" {
+  description = "Numeric GitHub user/org ID. Required for repos created after 2026-07-15 (immutable OIDC subject claims)."
+  type        = string
+  default     = ""
+  validation {
+    condition     = can(regex("^[0-9]*$", var.github_owner_id))
+    error_message = "github_owner_id must be digits only."
+  }
+}
+
+variable "github_repository_id" {
+  description = "Numeric GitHub repository ID. Required for repos created after 2026-07-15 (immutable OIDC subject claims)."
+  type        = string
+  default     = ""
+  validation {
+    condition     = can(regex("^[0-9]*$", var.github_repository_id))
+    error_message = "github_repository_id must be digits only."
+  }
+}
+
 variable "github_deploy_branch" {
   description = "Only this branch may assume the deploy role."
   type        = string
