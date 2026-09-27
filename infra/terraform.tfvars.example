@@ -1,0 +1,14 @@
+# Copy this file to terraform.tfvars and fill in your values.
+# terraform.tfvars is git-ignored so your email/IP never end up in the repository.
+
+alert_email       = "you@example.com"
+github_repository = "eguidey/aws-appsec-pipeline"
+
+# Recommended: only allow your own IP to reach the API. Find it at https://checkip.amazonaws.com
+# allowed_ingress_cidrs = ["203.0.113.25/32"]
+
+# Set to false if this AWS account already has a GitHub OIDC provider.
+# create_github_oidc_provider = true
+
+# 30-day free trial, then paid. Leave false unless you want to demo GuardDuty.
+# enable_guardduty = false

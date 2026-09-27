@@ -1,0 +1,211 @@
+name: AppSec Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege by default; jobs that talk to AWS add id-token: write.
+permissions:
+  contents: read
+
+concurrency:
+  group: pipeline-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  PYTHON_VERSION: "3.12"
+  # Only push/deploy from main, and only once the AWS infrastructure exists
+  # (the AWS_DEPLOY_ROLE_ARN repository variable is set after `terraform apply`).
+  CAN_DEPLOY: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && vars.AWS_DEPLOY_ROLE_ARN != '' }}
+
+jobs:
+  # ---------------------------------------------------------------- 1. Unit tests + lint
+  test:
+    name: Lint & unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+      - run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Lint (ruff)
+        run: ruff check .
+      - name: Unit & security tests (pytest)
+        run: pytest -v
+
+  # ---------------------------------------------------------------- 2. SAST
+  sast:
+    name: SAST (Bandit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "bandit>=1.7"
+      - name: Scan application code for security issues
+        run: bandit -r app wsgi.py gunicorn.conf.py --severity-level medium --confidence-level medium
+
+  # ---------------------------------------------------------------- 3. Dependency CVEs
+  dependencies:
+    name: Dependency scan (pip-audit)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install "pip-audit>=2.7"
+      - name: Check pinned dependencies against known vulnerabilities
+        run: pip-audit -r requirements.txt --strict --desc
+
+  # ---------------------------------------------------------------- 4. Secrets
+  secrets:
+    name: Secret scan (Gitleaks)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # scan the full history, not just the latest commit
+      - uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # ---------------------------------------------------------------- 5. IaC misconfigurations
+  iac:
+    name: IaC scan (Checkov)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+      - run: pip install checkov
+      - name: Scan Terraform
+        run: checkov -d infra --framework terraform --compact --quiet
+      - name: Scan Dockerfile
+        run: checkov -f Dockerfile --framework dockerfile --compact --quiet
+
+  # ---------------------------------------------------------------- 6. Build, scan image, push
+  image:
+    name: Build & scan image
+    needs: [test, sast, dependencies, secrets, iac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # OIDC token for AWS (used only when pushing)
+    outputs:
+      image: ${{ steps.push.outputs.image }}
+    env:
+      LOCAL_TAG: appsec-api:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build image (with GitHub Actions layer cache)
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ${{ env.LOCAL_TAG }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+          provenance: false
+
+      - name: Scan image for vulnerabilities (Trivy) - fail on HIGH/CRITICAL
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.LOCAL_TAG }}
+          format: table
+          severity: CRITICAL,HIGH
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Configure AWS credentials (OIDC - no stored keys)
+        if: env.CAN_DEPLOY == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: env.CAN_DEPLOY == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Push the exact image that was scanned
+        if: env.CAN_DEPLOY == 'true'
+        id: push
+        env:
+          REPO: ${{ vars.ECR_REPOSITORY }}
+          TAG: ${{ github.sha }}
+        run: |
+          IMAGE="${{ steps.ecr.outputs.registry }}/$REPO:$TAG"
+          # Tags are immutable in ECR, so a re-run of the same commit reuses the existing image.
+          if aws ecr describe-images --repository-name "$REPO" --image-ids imageTag="$TAG" > /dev/null 2>&1; then
+            echo "Image $TAG already exists in ECR - skipping push"
+          else
+            docker tag "$LOCAL_TAG" "$IMAGE"
+            docker push "$IMAGE"
+          fi
+          echo "image=$IMAGE" >> "$GITHUB_OUTPUT"
+
+  # ---------------------------------------------------------------- 7. Deploy to ECS Fargate
+  deploy:
+    name: Deploy to ECS Fargate
+    needs: image
+    if: needs.image.outputs.image != ''
+    runs-on: ubuntu-latest
+    environment: production # add required reviewers in repo settings for a manual approval gate
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      IMAGE: ${{ needs.image.outputs.image }}
+      CLUSTER: ${{ vars.ECS_CLUSTER }}
+      SERVICE: ${{ vars.ECS_SERVICE }}
+      FAMILY: ${{ vars.ECS_TASK_FAMILY }}
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Register new task definition revision with the new image
+        id: taskdef
+        run: |
+          aws ecs describe-task-definition --task-definition "$FAMILY" --query taskDefinition > current.json
+          jq --arg IMG "$IMAGE" --arg VER "${GITHUB_SHA::7}" '
+            .containerDefinitions[0].image = $IMG
+            | .containerDefinitions[0].environment |= map(if .name == "APP_VERSION" then .value = $VER else . end)
+            | del(.taskDefinitionArn, .revision, .status, .requiresAttributes, .compatibilities, .registeredAt, .registeredBy)
+          ' current.json > new.json
+          ARN=$(aws ecs register-task-definition --cli-input-json file://new.json --query taskDefinition.taskDefinitionArn --output text)
+          echo "arn=$ARN" >> "$GITHUB_OUTPUT"
+
+      - name: Roll out (circuit breaker auto-rolls back failed deployments)
+        run: |
+          aws ecs update-service --cluster "$CLUSTER" --service "$SERVICE" \
+            --task-definition "${{ steps.taskdef.outputs.arn }}" --desired-count 1 > /dev/null
+          aws ecs wait services-stable --cluster "$CLUSTER" --services "$SERVICE"
+
+      - name: Smoke test /health
+        run: |
+          TASK=$(aws ecs list-tasks --cluster "$CLUSTER" --service-name "$SERVICE" --query 'taskArns[0]' --output text)
+          ENI=$(aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK" \
+                --query "tasks[0].attachments[0].details[?name=='networkInterfaceId'].value" --output text)
+          IP=$(aws ec2 describe-network-interfaces --network-interface-ids "$ENI" \
+                --query 'NetworkInterfaces[0].Association.PublicIp' --output text)
+          echo "Task public IP: $IP"
+          if curl -fsS --max-time 10 "http://$IP:8000/health"; then
+            echo; echo "Smoke test passed"
+          else
+            echo "::warning::Could not reach the API from GitHub. Expected if allowed_ingress_cidrs is limited to your own IP."
+          fi
