@@ -127,7 +127,7 @@ jobs:
 
       - name: Configure AWS credentials (OIDC - no stored keys)
         if: env.CAN_DEPLOY == 'true'
-        uses: aws-actions/configure-aws-credentials@v4
+        uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
@@ -173,7 +173,7 @@ jobs:
       SERVICE: ${{ vars.ECS_SERVICE }}
       FAMILY: ${{ vars.ECS_TASK_FAMILY }}
     steps:
-      - uses: aws-actions/configure-aws-credentials@v4
+      - uses: aws-actions/configure-aws-credentials@v6
         with:
           role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
           aws-region: ${{ vars.AWS_REGION }}
