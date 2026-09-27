@@ -1,7 +1,7 @@
-# Base image is configurable. The default pulls the official Python image from
-# Amazon ECR Public, which avoids Docker Hub rate limits in CI.
-# checkov:skip=CKV_DOCKER_7:Base image comes from the PYTHON_IMAGE build arg, which is pinned to 3.12-alpine (never :latest)
-ARG PYTHON_IMAGE=public.ecr.aws/docker/library/python:3.12-alpine
+   # Base image is configurable (e.g. point it at a private mirror).
+   # Defaults to the official Python image on Docker Hub.
+   # checkov:skip=CKV_DOCKER_7:Base image comes from the PYTHON_IMAGE build arg, which is pinned to 3.12-alpine (never :latest)
+   ARG PYTHON_IMAGE=python:3.12-alpine
 
 # ---------------------------------------------------------------------------
 # Stage 1: build wheels (has compilers; never shipped)
